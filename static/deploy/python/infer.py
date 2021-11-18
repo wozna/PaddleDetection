@@ -16,8 +16,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from paddle.fluid import profiler
+
 import os
 import sys
+
+from paddle.fluid.executor import InferNativeConfig
 
 # add python path of PadleDetection to sys.path
 parent_path = os.path.abspath(os.path.join(__file__, *(['..'] * 3)))
@@ -59,6 +63,8 @@ class Detector(object):
         device (str): Choose the device you want to run, it can be: CPU/GPU/XPU, default is CPU
         run_mode (str): mode of running(fluid/trt_fp32/trt_fp16)
         threshold (float): threshold to reserve the result for output.
+        enable_mkldnn (bool): whether to turn on MKLDNN
+        enable_ptq (bool): whether to turn on post-training quantization
     """
 
     def __init__(self,
@@ -67,7 +73,9 @@ class Detector(object):
                  device='CPU',
                  run_mode='fluid',
                  threshold=0.5,
-                 trt_calib_mode=False):
+                 trt_calib_mode=False,
+                 enable_mkldnn=False,
+                 enable_ptq=False):
         self.config = config
         if self.config.use_python_inference:
             self.executor, self.program, self.fecth_targets = load_executor(
@@ -78,7 +86,10 @@ class Detector(object):
                 run_mode=run_mode,
                 min_subgraph_size=self.config.min_subgraph_size,
                 device=device,
-                trt_calib_mode=trt_calib_mode)
+                trt_calib_mode=trt_calib_mode,
+                enable_mkldnn=enable_mkldnn,
+                enable_ptq=enable_ptq,
+                detector_config=config)
 
     def preprocess(self, im):
         preprocess_ops = []
@@ -162,7 +173,8 @@ class Detector(object):
             for i in range(warmup):
                 self.predictor.zero_copy_run()
                 output_names = self.predictor.get_output_names()
-                boxes_tensor = self.predictor.get_output_tensor(output_names[0])
+                boxes_tensor = self.predictor.get_output_tensor(
+                    output_names[0])
                 np_boxes = boxes_tensor.copy_to_cpu()
                 if self.config.mask_resolution is not None:
                     masks_tensor = self.predictor.get_output_tensor(
@@ -172,7 +184,8 @@ class Detector(object):
                 if self.config.with_lmk is not None and self.config.with_lmk == True:
                     face_index = self.predictor.get_output_tensor(output_names[
                         1])
-                    landmark = self.predictor.get_output_tensor(output_names[2])
+                    landmark = self.predictor.get_output_tensor(
+                        output_names[2])
                     prior_boxes = self.predictor.get_output_tensor(output_names[
                         3])
                     np_face_index = face_index.copy_to_cpu()
@@ -182,9 +195,12 @@ class Detector(object):
 
             t1 = time.time()
             for i in range(repeats):
+                profiler.start_profiler("All")
                 self.predictor.zero_copy_run()
+                profiler.stop_profiler("total", "profile")
                 output_names = self.predictor.get_output_names()
-                boxes_tensor = self.predictor.get_output_tensor(output_names[0])
+                boxes_tensor = self.predictor.get_output_tensor(
+                    output_names[0])
                 np_boxes = boxes_tensor.copy_to_cpu()
                 if self.config.mask_resolution is not None:
                     masks_tensor = self.predictor.get_output_tensor(
@@ -194,7 +210,8 @@ class Detector(object):
                 if self.config.with_lmk is not None and self.config.with_lmk == True:
                     face_index = self.predictor.get_output_tensor(output_names[
                         1])
-                    landmark = self.predictor.get_output_tensor(output_names[2])
+                    landmark = self.predictor.get_output_tensor(
+                        output_names[2])
                     prior_boxes = self.predictor.get_output_tensor(output_names[
                         3])
                     np_face_index = face_index.copy_to_cpu()
@@ -225,14 +242,16 @@ class DetectorSOLOv2(Detector):
                  device='CPU',
                  run_mode='fluid',
                  threshold=0.5,
-                 trt_calib_mode=False):
+                 trt_calib_mode=False,
+                 enable_mkldnn=False):
         super(DetectorSOLOv2, self).__init__(
             config=config,
             model_dir=model_dir,
             device=device,
             run_mode=run_mode,
             threshold=threshold,
-            trt_calib_mode=trt_calib_mode)
+            trt_calib_mode=trt_calib_mode,
+            enable_mkldn=enable_mkldnn)
 
     def predict(self,
                 image,
@@ -385,13 +404,18 @@ def load_predictor(model_dir,
                    batch_size=1,
                    device='CPU',
                    min_subgraph_size=3,
-                   trt_calib_mode=False):
+                   trt_calib_mode=False,
+                   enable_mkldnn=False,
+                   enable_ptq=False,
+                   detector_config=None):
     """set AnalysisConfig, generate AnalysisPredictor
     Args:
         model_dir (str): root path of __model__ and __params__
         device (str): Choose the device you want to run, it can be: CPU/GPU/XPU, default is CPU
         trt_calib_mode (bool): If the model is produced by TRT offline quantitative
             calibration, trt_calib_mode need to set True
+            enable_mkldnn False
+            enable_ptq False
     Returns:
         predictor (PaddlePredictor): AnalysisPredictor
     Raises:
@@ -418,7 +442,11 @@ def load_predictor(model_dir,
         config.enable_xpu(10 * 1024 * 1024)
     else:
         config.disable_gpu()
-
+        if enable_mkldnn:
+            config.set_mkldnn_cache_capacity(0)
+            config.enable_mkldnn()
+            #config.switch_ir_debug()
+            config.pass_builder().append_pass("interpolate_mkldnn_pass")
     if run_mode in precision_map.keys():
         config.enable_tensorrt_engine(
             workspace_size=1 << 10,
@@ -431,18 +459,47 @@ def load_predictor(model_dir,
     # disable print log when predict
     config.disable_glog_info()
     # enable shared memory
-    config.enable_memory_optim()
+    if (not enable_mkldnn):
+        config.enable_memory_optim()
     # disable feed, fetch OP, needed by zero_copy_run
-    config.switch_use_feed_fetch_ops(False)
+    config.switch_use_feed_fetch_ops(True)
+    
+    if enable_ptq is True and detector_config is not None:
+        inputs, _ = warmup_preprocess(FLAGS.image_file, detector_config)
+        input_names = inputs.keys()
+        warmup_data = []
+
+        input_name = list(input_names)[0]
+        infer_data = fluid.core.PaddleTensor()
+        minputs = fluid.create_lod_tensor(np.array(inputs[input_name]), [[inputs[input_name].shape[0]]], fluid.core.CPUPlace())
+        infer_data.data = fluid.core.PaddleBuf(np.array(minputs))
+        infer_data.shape = np.array(inputs[input_name]).shape
+        infer_data.name = input_name
+        infer_data.dtype = fluid.core.PaddleDType.FLOAT32
+        infer_data.lod = minputs.lod()
+        warmup_data.append(infer_data)
+
+        # input_name = list(input_names)[1]
+        # label_data = fluid.core.PaddleTensor()
+        # #minputs = fluid.create_lod_tensor(np.array(inputs[input_name]), [[inputs[input_name].shape[0]]], fluid.core.CPUPlace())
+        # label_data.data = fluid.core.PaddleBuf(np.array(inputs[input_name].copy()))
+        # label_data.shape = np.array(inputs[input_name]).shape
+        # label_data.name = input_name
+        # label_data.dtype = fluid.core.PaddleDType.FLOAT32
+        # warmup_data.append(label_data)
+
+        config.enable_quantizer()
+        config.quantizer_config().set_quant_data(warmup_data)
+        config.quantizer_config().set_quant_batch_size(batch_size)
+
     predictor = fluid.core.create_paddle_predictor(config)
+
     return predictor
 
 
 def load_executor(model_dir, device='CPU'):
     if device == 'GPU':
         place = fluid.CUDAPlace(0)
-    else:
-        place = fluid.CPUPlace()
     exe = fluid.Executor(place)
     program, feed_names, fetch_targets = fluid.io.load_inference_model(
         dirname=model_dir,
@@ -537,6 +594,19 @@ def predict_video(detector, camera_id):
     writer.release()
 
 
+def warmup_preprocess(im, config):
+    preprocess_ops = []
+    for op_info in config.preprocess_infos:
+        new_op_info = op_info.copy()
+        op_type = new_op_info.pop('type')
+        if op_type == 'Resize':
+            new_op_info['arch'] = config.arch
+        preprocess_ops.append(eval(op_type)(**new_op_info))
+    im, im_info = preprocess(im, preprocess_ops)
+    inputs = create_inputs(im, im_info, config.arch)
+    return inputs, im_info
+
+
 def main():
     config = Config(FLAGS.model_dir)
     detector = Detector(
@@ -544,14 +614,17 @@ def main():
         FLAGS.model_dir,
         device=FLAGS.device,
         run_mode=FLAGS.run_mode,
-        trt_calib_mode=FLAGS.trt_calib_mode)
+        trt_calib_mode=FLAGS.trt_calib_mode,
+        enable_mkldnn=FLAGS.enable_mkldnn,
+        enable_ptq=FLAGS.enable_ptq)
     if config.arch == 'SOLOv2':
         detector = DetectorSOLOv2(
             config,
             FLAGS.model_dir,
             device=FLAGS.device,
             run_mode=FLAGS.run_mode,
-            trt_calib_mode=FLAGS.trt_calib_mode)
+            trt_calib_mode=FLAGS.trt_calib_mode,
+            enable_mkldnn=FLAGS.enable_mkldnn)
     # predict from image
     if FLAGS.image_file != '':
         predict_image(detector)
@@ -617,7 +690,18 @@ if __name__ == '__main__':
         default=False,
         help="If the model is produced by TRT offline quantitative "
         "calibration, trt_calib_mode need to set True.")
-
+    parser.add_argument(
+        "--enable_mkldnn",
+        type=ast.literal_eval,
+        default=False,
+        help="This is to enable mkldnn"
+    )
+    parser.add_argument(
+        "--enable_ptq",
+        type=ast.literal_eval,
+        default=False,
+        help="This is to enable post-training quantization"
+    )
     FLAGS = parser.parse_args()
     print_arguments(FLAGS)
     if FLAGS.image_file != '' and FLAGS.video_file != '':
