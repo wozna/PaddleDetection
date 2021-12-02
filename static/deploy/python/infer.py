@@ -462,7 +462,7 @@ def load_predictor(model_dir,
     if (not enable_mkldnn):
         config.enable_memory_optim()
     # disable feed, fetch OP, needed by zero_copy_run
-    config.switch_use_feed_fetch_ops(True)
+    config.switch_use_feed_fetch_ops(False)
     
     if enable_ptq is True and detector_config is not None:
         inputs, _ = warmup_preprocess(FLAGS.image_file, detector_config)
